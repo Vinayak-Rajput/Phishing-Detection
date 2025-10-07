@@ -1,6 +1,12 @@
 import pandas as pd
 import os
 from urllib.parse import urlparse
+import math
+import whois # NEW: Import for WHOIS lookups
+from tqdm import tqdm # NEW: Import for progress bar
+
+# Initialize tqdm for pandas
+tqdm.pandas()
 
 # --- Configuration ---
 CT_LOGS_INPUT = 'data/raw/discovered_urls.txt'
@@ -18,7 +24,6 @@ def load_domains_from_file(file_path):
 def get_domain_from_url(url):
     """Extracts the domain/hostname from a full URL."""
     try:
-        # Prepending http:// if no scheme is present, to allow urlparse to work correctly
         if '://' not in url:
             url = 'http://' + url
         parsed_url = urlparse(url)
@@ -26,34 +31,33 @@ def get_domain_from_url(url):
     except Exception:
         return ''
 
-# --- Feature Extraction Functions (based on Annexure A) ---
+# --- Feature Extraction Functions ---
 
-def get_url_length(url):
-    """Calculates the total length of the URL string."""
-    return len(url)
+def calculate_entropy(text):
+    if not text: return 0.0
+    prob = [float(text.count(c)) / len(text) for c in dict.fromkeys(list(text))]
+    entropy = -sum([p * math.log(p) / math.log(2.0) for p in prob])
+    return entropy
 
-def count_dots(url):
-    """Counts the number of dots in the URL."""
-    return url.count('.')
-
-def count_hyphens(url):
-    """Counts the number of hyphens in the URL."""
-    return url.count('-')
-
-def count_special_chars(url):
-    """Counts various special characters in the URL."""
-    special_chars = ['@', '?', '=', '&', '%', '$', '#', '/']
-    return sum(url.count(char) for char in special_chars)
+def get_creation_date(domain):
+    """
+    NEW: Performs a WHOIS lookup to find the domain's creation date.
+    Returns NaT (Not a Time) on failure.
+    """
+    try:
+        w = whois.whois(domain)
+        # whois can return a list of dates, so we take the first if it's a list
+        if isinstance(w.creation_date, list):
+            return w.creation_date[0]
+        return w.creation_date
+    except Exception:
+        return pd.NaT # Return pandas' Not a Time for missing values
 
 # --- Main execution block ---
 if __name__ == "__main__":
     print("--> Starting feature extraction process...")
-
-    # Load domains from both sources
     ct_domains = load_domains_from_file(CT_LOGS_INPUT)
     typo_domains = load_domains_from_file(TYPOSQUAT_INPUT)
-    
-    # Combine and get unique domains
     all_domains = sorted(list(set(ct_domains + typo_domains)))
     
     if not all_domains:
@@ -62,14 +66,23 @@ if __name__ == "__main__":
         print(f"--> Loaded a total of {len(all_domains)} unique domains.")
         df = pd.DataFrame(all_domains, columns=['url'])
 
-        # --- Apply feature extraction functions ---
-        print("--> Extracting URL-based features...")
-        df['url_length'] = df['url'].apply(get_url_length)
+        print("--> Extracting URL-based, Lexical, and Domain-based features...")
+        
+        # --- Basic URL/Domain Features ---
         df['domain'] = df['url'].apply(get_domain_from_url)
-        df['domain_length'] = df['domain'].apply(lambda x: len(x))
-        df['dots_count'] = df['url'].apply(count_dots)
-        df['hyphens_count'] = df['url'].apply(count_hyphens)
-        df['special_chars_count'] = df['url'].apply(count_special_chars)
+        # Drop any rows where we couldn't parse the domain
+        df.dropna(subset=['domain'], inplace=True)
+        df = df[df['domain'] != '']
+
+        # --- WHOIS Features (This part will be slow) ---
+        print("[*] Performing WHOIS lookups to get creation dates. This will take a while...")
+        df['creation_date'] = df['domain'].progress_apply(get_creation_date)
+        
+        # --- Calculate Domain Age ---
+        # Convert creation_date to datetime objects, coercing errors
+        df['creation_date'] = pd.to_datetime(df['creation_date'], errors='coerce')
+        # Calculate age in days from today
+        df['domain_age_days'] = (pd.to_datetime('today') - df['creation_date']).dt.days
 
         # --- Save results ---
         os.makedirs(os.path.dirname(FEATURES_OUTPUT), exist_ok=True)
@@ -77,5 +90,5 @@ if __name__ == "__main__":
 
         print(f"\n[+] Feature extraction complete!")
         print(f"--> Results saved to {FEATURES_OUTPUT}")
-        print("\n--- Feature DataFrame Head ---")
-        print(df.head())
+        print("\n--- Feature DataFrame Head (sample) ---")
+        print(df[['domain', 'creation_date', 'domain_age_days']].head())
